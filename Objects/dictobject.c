@@ -116,6 +116,19 @@ converting the dict to the combined table.
 #include "dict-common.h"
 #include "stringlib/eq.h"    /* to get unicode_eq() */
 
+
+static void repr(PyObject *obj) {
+    PyObject* repr = PyObject_Repr(obj);
+    PyObject* str = PyUnicode_AsEncodedString(repr, "utf-8", "~E~");
+    const char *bytes = PyBytes_AS_STRING(str);
+
+    printf("REPR: %s\n", bytes);
+
+    Py_XDECREF(repr);
+    Py_XDECREF(str);
+}
+
+
 /*[clinic input]
 class dict "PyDictObject *" "&PyDict_Type"
 [clinic start generated code]*/
@@ -3108,6 +3121,7 @@ PyDoc_STRVAR(clear__doc__,
 PyDoc_STRVAR(copy__doc__,
 "D.copy() -> a shallow copy of D");
 
+
 /* Forward */
 static PyObject *dictkeys_new(PyObject *, PyObject *);
 static PyObject *dictitems_new(PyObject *, PyObject *);
@@ -3120,15 +3134,19 @@ PyDoc_STRVAR(items__doc__,
 PyDoc_STRVAR(values__doc__,
              "D.values() -> an object providing a view on D's values");
 
+
+/* XXX: DEVELOPMENT ONLY */
+static PyObject * dict_discard(PyDictObject *mp, PyObject *args);
+
 static PyMethodDef mapp_methods[] = {
     DICT___CONTAINS___METHODDEF
-    {"__getitem__", (PyCFunction)(void(*)(void))dict_subscript,        METH_O | METH_COEXIST,
+    {"__getitem__",     (PyCFunction)(void(*)(void))dict_subscript,        METH_O | METH_COEXIST,
      getitem__doc__},
     {"__sizeof__",      (PyCFunction)(void(*)(void))dict_sizeof,       METH_NOARGS,
      sizeof__doc__},
     DICT_GET_METHODDEF
     DICT_SETDEFAULT_METHODDEF
-    {"pop",         (PyCFunction)dict_pop,          METH_VARARGS,
+    {"pop",             (PyCFunction)dict_pop,          METH_VARARGS,
      pop__doc__},
     {"popitem",         (PyCFunction)(void(*)(void))dict_popitem,      METH_NOARGS,
      popitem__doc__},
@@ -3146,6 +3164,8 @@ static PyMethodDef mapp_methods[] = {
     {"copy",            (PyCFunction)dict_copy,         METH_NOARGS,
      copy__doc__},
     DICT___REVERSED___METHODDEF
+    {"discard",         (PyCFunction)dict_discard,       METH_VARARGS,
+     copy__doc__},  /* XXX: DEVELOPMENT ONLY */
     {NULL,              NULL}   /* sentinel */
 };
 
@@ -3184,19 +3204,207 @@ _PyDict_Contains(PyObject *op, PyObject *key, Py_hash_t hash)
     return (ix != DKIX_EMPTY && value != NULL);
 }
 
-/* Hack to implement "key in dict" */
+/* a + b := (r = a.copy(); r.update(b); return r) */
+static PyObject *
+PyDict_Concat(PyObject *self, PyObject *other)
+{
+    PyObject *copy;
+    copy = PyDict_Copy((PyObject*)self);
+    PyDict_Update(copy, other);
+    return copy;
+}
+
+static PyObject *
+PyDict_InPlace_Concat(PyObject *self, PyObject *other)
+{
+    Py_INCREF(self);
+    PyDict_Update(self, other);
+    return self;
+}
+
+
+/* Implement "key in dict", "d1 + d2" and "d1 += d2" */
 static PySequenceMethods dict_as_sequence = {
-    0,                          /* sq_length */
-    0,                          /* sq_concat */
-    0,                          /* sq_repeat */
-    0,                          /* sq_item */
-    0,                          /* sq_slice */
-    0,                          /* sq_ass_item */
-    0,                          /* sq_ass_slice */
-    PyDict_Contains,            /* sq_contains */
-    0,                          /* sq_inplace_concat */
-    0,                          /* sq_inplace_repeat */
+    0,                                  /* sq_length */
+    (binaryfunc)PyDict_Concat,          /* sq_concat */
+    0,                                  /* sq_repeat */
+    0,                                  /* sq_item */
+    0,                                  /* sq_slice */
+    0,                                  /* sq_ass_item */
+    0,                                  /* sq_ass_slice */
+    (objobjproc)PyDict_Contains,        /* sq_contains */
+    (binaryfunc)PyDict_InPlace_Concat,  /* sq_inplace_concat */
+    0,                                  /* sq_inplace_repeat */
 };
+
+
+int
+_PyDict_Discard_KnownHash(PyObject *dict, PyObject *key, Py_hash_t hash)
+{
+    Py_ssize_t ix, hashpos;
+    PyObject *old_value, *old_key;
+    PyDictKeyEntry *ep;
+    PyDictObject *mp;
+
+    assert(PyDict_Check(dict));
+    mp = (PyDictObject *)dict;
+
+    if (mp->ma_used == 0) {
+        return 0;
+    }
+
+    ix = (mp->ma_keys->dk_lookup)(mp, key, hash, &old_value);
+    if (ix == DKIX_ERROR)
+        return -1;
+    if (ix == DKIX_EMPTY || old_value == NULL) {
+        return 0;
+    }
+
+    hashpos = lookdict_index(mp->ma_keys, hash, ix);
+    assert(hashpos >= 0);
+    assert(old_value != NULL);
+    mp->ma_used--;
+    mp->ma_version_tag = DICT_NEXT_VERSION();
+    dictkeys_set_index(mp->ma_keys, hashpos, DKIX_DUMMY);
+    ep = &DK_ENTRIES(mp->ma_keys)[ix];
+    ENSURE_ALLOWS_DELETIONS(mp);
+    old_key = ep->me_key;
+    ep->me_key = NULL;
+    ep->me_value = NULL;
+    Py_DECREF(old_key);
+
+    assert(_PyDict_CheckConsistency(mp));
+    return 1;
+}
+
+int
+_PyDict_Discard(PyObject *dict, PyObject *key)
+{
+    Py_hash_t hash;
+
+    /*
+    Are these next 3 lines redundant with
+
+    if (mp->ma_used == 0) {
+        return 0;
+    }
+
+    from _PyDict_Discard_KnownHash
+    */
+    if (((PyDictObject *)dict)->ma_used == 0) {
+        return 0;
+    }
+    if (!PyUnicode_CheckExact(key) ||
+        (hash = ((PyASCIIObject *) key)->hash) == -1) {
+        hash = PyObject_Hash(key);
+        if (hash == -1)
+            return -1;
+    }
+    return _PyDict_Discard_KnownHash(dict, key, hash);
+}
+
+static PyObject *
+dict_discard(PyDictObject *mp, PyObject *args)
+{
+    PyObject *key = NULL;
+    if(!PyArg_UnpackTuple(args, "discard", 1, 1, &key))
+        return NULL;
+
+    _PyDict_Discard((PyObject*)mp, key);
+    Py_RETURN_NONE;
+}
+
+static int
+dict_difference_internal(PyDictObject *mp, PyObject *other)
+{
+    if (PyDict_GET_SIZE(other) == 0) {
+        printf("empty self\n");
+        return 0;
+    }
+
+    if ((PyObject *)mp == other) {
+        PyDict_Clear((PyObject *)mp);
+        printf("self-reference\n");
+        return 0;
+    }
+
+    PyObject *iter = PyObject_GetIter(other);
+
+    if (iter == NULL) {
+        printf("iter was null\n");
+        return -1;
+    }
+
+    PyObject *key;
+    while ((key = PyIter_Next(iter)) != NULL) {
+        if (key == NULL) {
+            break;
+        }
+
+        _PyDict_Discard((PyObject*)mp, key);
+
+        Py_DECREF(key);
+    }
+    Py_DECREF(iter);
+
+    if (PyErr_Occurred())
+        return -1;
+
+    return 0;
+}
+
+/* Implement d1 - d2 */
+static PyObject *
+dict_sub(PyDictObject *mp, PyObject *other)
+{
+    PyObject *copy;
+    copy = PyDict_Copy((PyObject*)mp);
+    dict_difference_internal((PyDictObject*)copy, other);
+    return copy;
+}
+
+/* Implement d1 -= d2 (or d1 -= <keys sequence>) */
+static PyObject *
+dict_isub(PyDictObject *mp, PyObject *other)
+{
+    Py_INCREF((PyObject*)mp);
+    dict_difference_internal(mp, other);
+    return (PyObject*)mp;
+}
+
+
+static PyNumberMethods dict_as_number = {
+    0,                                  /*nb_add*/
+    (binaryfunc)dict_sub,               /*nb_subtract*/
+    0,                                  /*nb_multiply*/
+    0,                                  /*nb_remainder*/
+    0,                                  /*nb_divmod*/
+    0,                                  /*nb_power*/
+    0,                                  /*nb_negative*/
+    0,                                  /*nb_positive*/
+    0,                                  /*nb_absolute*/
+    0,                                  /*nb_bool*/
+    0,                                  /*nb_invert*/
+    0,                                  /*nb_lshift*/
+    0,                                  /*nb_rshift*/
+    0,                                  /*nb_and*/
+    0,                                  /*nb_xor*/
+    0,                                  /*nb_or*/
+    0,                                  /*nb_int*/
+    0,                                  /*nb_reserved*/
+    0,                                  /*nb_float*/
+    0,                                  /*nb_inplace_add*/
+    (binaryfunc)dict_isub,              /*nb_inplace_subtract*/
+    0,                                  /*nb_inplace_multiply*/
+    0,                                  /*nb_inplace_remainder*/
+    0,                                  /*nb_inplace_power*/
+    0,                                  /*nb_inplace_lshift*/
+    0,                                  /*nb_inplace_rshift*/
+    0,                                  /*nb_inplace_and*/
+    0,                                  /*nb_inplace_xor*/
+    0,                                  /*nb_inplace_or*/
+};
+
 
 static PyObject *
 dict_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
@@ -3259,7 +3467,7 @@ PyTypeObject PyDict_Type = {
     0,                                          /* tp_setattr */
     0,                                          /* tp_reserved */
     (reprfunc)dict_repr,                        /* tp_repr */
-    0,                                          /* tp_as_number */
+    &dict_as_number,                            /* tp_as_number */
     &dict_as_sequence,                          /* tp_as_sequence */
     &dict_as_mapping,                           /* tp_as_mapping */
     PyObject_HashNotImplemented,                /* tp_hash */
