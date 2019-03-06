@@ -3135,9 +3135,6 @@ PyDoc_STRVAR(values__doc__,
              "D.values() -> an object providing a view on D's values");
 
 
-/* XXX: DEVELOPMENT ONLY */
-static PyObject * dict_discard(PyDictObject *mp, PyObject *args);
-
 static PyMethodDef mapp_methods[] = {
     DICT___CONTAINS___METHODDEF
     {"__getitem__",     (PyCFunction)(void(*)(void))dict_subscript,        METH_O | METH_COEXIST,
@@ -3164,8 +3161,6 @@ static PyMethodDef mapp_methods[] = {
     {"copy",            (PyCFunction)dict_copy,         METH_NOARGS,
      copy__doc__},
     DICT___REVERSED___METHODDEF
-    {"discard",         (PyCFunction)dict_discard,       METH_VARARGS,
-     copy__doc__},  /* XXX: DEVELOPMENT ONLY */
     {NULL,              NULL}   /* sentinel */
 };
 
@@ -3209,7 +3204,7 @@ static PyObject *
 PyDict_Concat(PyObject *self, PyObject *other)
 {
     PyObject *copy;
-    copy = PyDict_Copy((PyObject*)self);
+    copy = PyDict_Copy(self);
     PyDict_Update(copy, other);
     return copy;
 }
@@ -3237,115 +3232,89 @@ static PySequenceMethods dict_as_sequence = {
     0,                                  /* sq_inplace_repeat */
 };
 
-
-int
-_PyDict_Discard_KnownHash(PyObject *dict, PyObject *key, Py_hash_t hash)
-{
-    Py_ssize_t ix, hashpos;
-    PyObject *old_value, *old_key;
-    PyDictKeyEntry *ep;
-    PyDictObject *mp;
-
-    assert(PyDict_Check(dict));
-    mp = (PyDictObject *)dict;
-
-    if (mp->ma_used == 0) {
-        return 0;
-    }
-
-    ix = (mp->ma_keys->dk_lookup)(mp, key, hash, &old_value);
-    if (ix == DKIX_ERROR)
-        return -1;
-    if (ix == DKIX_EMPTY || old_value == NULL) {
-        return 0;
-    }
-
-    hashpos = lookdict_index(mp->ma_keys, hash, ix);
-    assert(hashpos >= 0);
-    assert(old_value != NULL);
-    mp->ma_used--;
-    mp->ma_version_tag = DICT_NEXT_VERSION();
-    dictkeys_set_index(mp->ma_keys, hashpos, DKIX_DUMMY);
-    ep = &DK_ENTRIES(mp->ma_keys)[ix];
-    ENSURE_ALLOWS_DELETIONS(mp);
-    old_key = ep->me_key;
-    ep->me_key = NULL;
-    ep->me_value = NULL;
-    Py_DECREF(old_key);
-
-    assert(_PyDict_CheckConsistency(mp));
-    return 1;
-}
-
-int
-_PyDict_Discard(PyObject *dict, PyObject *key)
-{
-    Py_hash_t hash;
-
-    /*
-    Are these next 3 lines redundant with
-
-    if (mp->ma_used == 0) {
-        return 0;
-    }
-
-    from _PyDict_Discard_KnownHash
-    */
-    if (((PyDictObject *)dict)->ma_used == 0) {
-        return 0;
-    }
-    if (!PyUnicode_CheckExact(key) ||
-        (hash = ((PyASCIIObject *) key)->hash) == -1) {
-        hash = PyObject_Hash(key);
-        if (hash == -1)
-            return -1;
-    }
-    return _PyDict_Discard_KnownHash(dict, key, hash);
-}
-
-static PyObject *
-dict_discard(PyDictObject *mp, PyObject *args)
-{
-    PyObject *key = NULL;
-    if(!PyArg_UnpackTuple(args, "discard", 1, 1, &key))
-        return NULL;
-
-    _PyDict_Discard((PyObject*)mp, key);
-    Py_RETURN_NONE;
-}
-
 static int
-dict_difference_internal(PyDictObject *mp, PyObject *other)
+dict_difference_internal(PyDictObject *mp, PyObject *other, int require_mapping)
 {
-    if (PyDict_GET_SIZE(other) == 0) {
-        printf("empty self\n");
-        return 0;
-    }
-
     if ((PyObject *)mp == other) {
         PyDict_Clear((PyObject *)mp);
-        printf("self-reference\n");
         return 0;
     }
 
-    PyObject *iter = PyObject_GetIter(other);
+	if (require_mapping && !PyMapping_Check(other)) {
+		printf("Raise: PyMapping_Check == False\n");
+		printf("dict - other requires other to be a dict (or mapping?)\n");
+		return -1;
+	}
 
-    if (iter == NULL) {
-        printf("iter was null\n");
-        return -1;
-    }
+	/* See if we can determine the length of other, in which case we can try
+	to make an informed decision about which set of keys to iterate over */
+	Py_ssize_t sz_self, sz_other;
+	sz_self = PyDict_Size((PyObject*)mp);
+	sz_other = PySequence_Length(other);
 
-    PyObject *key;
-    while ((key = PyIter_Next(iter)) != NULL) {
-        if (key == NULL) {
-            break;
-        }
+	if (sz_other == 0) {
+		return 0;
+	}
 
-        _PyDict_Discard((PyObject*)mp, key);
+	PyObject *iter, *key;
+	int other_fast_membership = (PyDict_Check(other) || PySet_Check(other));
+	if (sz_other == -1 || !other_fast_membership || (sz_self > sz_other)) {
+		/* Either we're unsure of the length of other, we're unsure of whether other
+		supports fast membership testing, or self is longer than other.
 
-        Py_DECREF(key);
-    }
-    Py_DECREF(iter);
+		Iterate over other, discarding its keys from self */
+		iter = PyObject_GetIter(other);
+		if (iter == NULL) {
+			return -1;
+		}
+
+		while ((key = PyIter_Next(iter)) != NULL) {
+			if (key == NULL) {
+				break;
+			}
+
+			/* If require_mapping == False, key could be a 2-tuple which the PEP 
+			indicates we should unpack as (key,value) pairs */
+
+			/* TODO: Implement this */
+
+			PyDict_DelItem((PyObject*)mp, key);
+			PyErr_Clear();
+
+			Py_DECREF(key);
+		}
+		Py_DECREF(iter);
+	}
+	else
+	{
+		/* Iterate over self, discarding keys not in other */
+		PyListObject *keys = PyDict_Keys((PyObject*)mp);
+		if (keys == NULL) {
+			return -1;
+		}
+
+		iter = PyObject_GetIter((PyObject*)keys);
+		if (iter == NULL) {
+			return -1;
+		}
+
+		while ((key = PyIter_Next(iter)) != NULL) {
+			if (key == NULL) {
+				break;
+			}
+
+			if (!PySequence_Contains(other, key)) {
+				PyDict_DelItem((PyObject*)mp, key);
+			}
+
+			Py_DECREF(key);
+		}
+		Py_DECREF(iter);
+		Py_DECREF(keys);
+	}
+	
+
+    
 
     if (PyErr_Occurred())
         return -1;
@@ -3359,7 +3328,7 @@ dict_sub(PyDictObject *mp, PyObject *other)
 {
     PyObject *copy;
     copy = PyDict_Copy((PyObject*)mp);
-    dict_difference_internal((PyDictObject*)copy, other);
+    dict_difference_internal((PyDictObject*)copy, other, 1);
     return copy;
 }
 
@@ -3368,7 +3337,7 @@ static PyObject *
 dict_isub(PyDictObject *mp, PyObject *other)
 {
     Py_INCREF((PyObject*)mp);
-    dict_difference_internal(mp, other);
+    dict_difference_internal(mp, other, 0);
     return (PyObject*)mp;
 }
 
