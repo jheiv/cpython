@@ -3205,15 +3205,62 @@ PyDict_Concat(PyObject *self, PyObject *other)
 {
     PyObject *copy;
     copy = PyDict_Copy(self);
-    PyDict_Update(copy, other);
+    if (PyDict_Update(copy, other) != 0) {
+        printf("PyDict_Update() returned 0.\n");
+        PyErr_SetString(PyExc_TypeError, "Exception A");
+        return NULL;
+    }
     return copy;
+}
+
+/* Return 
+    1 if other is PyDict_Merge-able (has .keys())
+    -1 if failure
+*/
+static int
+dict_other_type(PyObject *other)
+{
+    int result;
+
+    _Py_IDENTIFIER(keys);
+    PyObject *func;
+    if (_PyObject_LookupAttrId(other, &PyId_keys, &func) < 0) {
+        result = -1;
+    }
+    else if (func != NULL) {
+        Py_DECREF(func);
+        return 1;
+    }
+    else {
+        return 0;
+    }
 }
 
 static PyObject *
 PyDict_InPlace_Concat(PyObject *self, PyObject *other)
 {
     Py_INCREF(self);
-    PyDict_Update(self, other);
+    int other_type;
+    if ((other_type = dict_other_type(other)) == -1) {
+        printf("dict_other_type() returned -1.\n");
+        PyErr_SetString(PyExc_TypeError, "Exception B");
+        return NULL;
+    }
+    if (other_type == 1) {
+        if (PyDict_Merge(self, other, 1) != 0) {
+            printf("PyDict_Merge() returned 0.\n");
+            PyErr_SetString(PyExc_TypeError, "Exception C");
+            return NULL;
+        }
+    }
+    else {
+        if (PyDict_MergeFromSeq2(self, other, 1) != 0) {
+            printf("PyDict_MergeFromSeq2() returned 0.\n");
+            PyErr_SetString(PyExc_TypeError, "Exception D");
+            return NULL;
+        }
+    }
+    
     return self;
 }
 
@@ -3240,79 +3287,151 @@ dict_difference_internal(PyDictObject *mp, PyObject *other, int require_mapping)
         return 0;
     }
 
-	if (require_mapping && !PyMapping_Check(other)) {
-		printf("Raise: PyMapping_Check == False\n");
-		printf("dict - other requires other to be a dict (or mapping?)\n");
-		return -1;
-	}
+    if (require_mapping && !PyMapping_Check(other)) {
+        printf("Raise: PyMapping_Check == False\n");
+        printf("dict - other requires other to be a dict (or mapping?)\n");
+        return -1;
+    }
 
-	/* See if we can determine the length of other, in which case we can try
-	to make an informed decision about which set of keys to iterate over */
-	Py_ssize_t sz_self, sz_other;
-	sz_self = PyDict_Size((PyObject*)mp);
-	sz_other = PySequence_Length(other);
+    /* See if we can determine the length of other, in which case we can try
+    to make an informed decision about which set of keys to iterate over */
+    Py_ssize_t sz_self, sz_other;
+    sz_self = PyDict_Size((PyObject*)mp);
+    sz_other = PySequence_Length(other);
 
-	if (sz_other == 0) {
-		return 0;
-	}
+    if (sz_other == 0) {
+        return 0;
+    }
 
-	PyObject *iter, *key;
-	int other_fast_membership = (PyDict_Check(other) || PySet_Check(other));
-	if (sz_other == -1 || !other_fast_membership || (sz_self > sz_other)) {
-		/* Either we're unsure of the length of other, we're unsure of whether other
-		supports fast membership testing, or self is longer than other.
+    PyObject *iter, *key;
+    int other_fast_membership = (PyDict_Check(other) || PySet_Check(other));
+    if (sz_other == -1 || !other_fast_membership || (sz_self > sz_other)) {
+        /* Either we're unsure of the length of other, we're unsure of whether other
+        supports fast membership testing, or self is longer than other.
 
-		Iterate over other, discarding its keys from self */
-		iter = PyObject_GetIter(other);
-		if (iter == NULL) {
-			return -1;
-		}
+        Iterate over other, discarding its keys from self */
+        int other_type;
+        if ((other_type = dict_other_type(other)) == -1) {
+            printf("dict_other_type() returned -1.\n");
+            PyErr_SetString(PyExc_TypeError, "Exception E");
+            return NULL;
+        }
+        if (other_type == 1)
+        {
+            iter = PyObject_GetIter(other);
+            if (iter == NULL) {
+                return -1;
+            }
 
-		while ((key = PyIter_Next(iter)) != NULL) {
-			if (key == NULL) {
-				break;
-			}
+            while ((key = PyIter_Next(iter)) != NULL) {
+                if (key == NULL) {
+                    break;
+                }
 
-			/* If require_mapping == False, key could be a 2-tuple which the PEP 
-			indicates we should unpack as (key,value) pairs */
+                PyDict_DelItem((PyObject*)mp, key);
+                PyErr_Clear();
 
-			/* TODO: Implement this */
+                Py_DECREF(key);
+            }
+            Py_DECREF(iter);
+        }
+        else
+        {
+            /* Support 2-tuple unpacking */
+            PyObject *it;       /* iter(seq2) */
+            Py_ssize_t i;       /* index into seq2 of current element */
+            PyObject *item;     /* seq2[i] */
+            PyObject *fast;     /* item as a 2-tuple or 2-list */
 
-			PyDict_DelItem((PyObject*)mp, key);
-			PyErr_Clear();
+            it = PyObject_GetIter(other);
+            if (it == NULL) {
+                return -1;
+            }
 
-			Py_DECREF(key);
-		}
-		Py_DECREF(iter);
-	}
-	else
-	{
-		/* Iterate over self, discarding keys not in other */
-		PyListObject *keys = PyDict_Keys((PyObject*)mp);
-		if (keys == NULL) {
-			return -1;
-		}
+            for (i = 0; ; ++i) {
+                Py_ssize_t n;
 
-		iter = PyObject_GetIter((PyObject*)keys);
-		if (iter == NULL) {
-			return -1;
-		}
+                fast = NULL;
+                item = PyIter_Next(it);
+                if (item == NULL) {
+                    if (PyErr_Occurred())
+                        goto Fail;
+                    break;
+                }
 
-		while ((key = PyIter_Next(iter)) != NULL) {
-			if (key == NULL) {
-				break;
-			}
+                /* Convert item to sequence, and verify length 2. */
+                fast = PySequence_Fast(item, "");
+                if (fast == NULL) {
+                    if (PyErr_ExceptionMatches(PyExc_TypeError))
+                        PyErr_Format(PyExc_TypeError,
+                            "cannot convert dictionary discard "
+                            "sequence element #%zd to a sequence",
+                            i);
+                    goto Fail;
+                }
+                n = PySequence_Fast_GET_SIZE(fast);
+                if (n != 2) {
+                    PyErr_Format(PyExc_ValueError,
+                        "dictionary discard sequence element #%zd "
+                        "has length %zd; 2 is required",
+                        i, n);
+                    goto Fail;
+                }
 
-			if (!PySequence_Contains(other, key)) {
-				PyDict_DelItem((PyObject*)mp, key);
-			}
+                /* Discard any key corresponding to this (key, value) pair. */
+                key = PySequence_Fast_GET_ITEM(fast, 0);
+                Py_INCREF(key);
+                if (PyErr_Occurred()) {
+                    Py_DECREF(key);
+                    goto Fail;
+                }
 
-			Py_DECREF(key);
-		}
-		Py_DECREF(iter);
-		Py_DECREF(keys);
-	}
-	
+                PyDict_DelItem((PyObject*)mp, key);
+                PyErr_Clear();
+
+                Py_DECREF(key);
+                Py_DECREF(fast);
+                Py_DECREF(item);
+            }
+
+            goto Return;
+
+        Fail:
+            printf("Goto'd Fail.\n");
+            Py_XDECREF(item);
+            Py_XDECREF(fast);        
+        Return:
+            ; /* Nothing */
+        }
+    }
+    else
+    {
+        /* Iterate over self, discarding keys not in other */
+        PyListObject *keys = PyDict_Keys((PyObject*)mp);
+        if (keys == NULL) {
+            return -1;
+        }
+
+        iter = PyObject_GetIter((PyObject*)keys);
+        if (iter == NULL) {
+            return -1;
+        }
+
+        while ((key = PyIter_Next(iter)) != NULL) {
+            if (key == NULL) {
+                break;
+            }
+
+            if (PySequence_Contains(other, key)) {
+                PyDict_DelItem((PyObject*)mp, key);
+            }
+
+            Py_DECREF(key);
+        }
+        Py_DECREF(iter);
+        Py_DECREF(keys);
+    }
+    
 
     
 
